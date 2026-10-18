@@ -113,7 +113,7 @@ export OPENAI_API_KEY=...
 python run.py --provider openai --model <model-id> --base-url https://api.openai.com/v1
 python run.py --provider openai --model Qwen/Qwen2.5-7B-Instruct --base-url http://localhost:8000/v1
 
-# Score everything in results/raw/ and update the table above
+# Score every run and update the table above
 python score.py
 ```
 
@@ -131,10 +131,11 @@ Each model run with `--samples 3` is 720 calls (60 scenarios x 4 conditions x 3 
 ## Repo layout
 
 ```
-data/scenarios.jsonl   60 matched scenarios (obvious + hidden sets) with labels and risk tags
-run.py                 runs one model across all 4 conditions
-score.py               computes metrics and writes results/summary.md
-results/raw/           one JSONL of raw responses per model run
+scenarios.jsonl             60 matched scenarios (obvious + hidden sets) with labels and risk tags
+run.py                      runs one model across all 4 conditions
+score.py                    computes metrics, writes summary.md, and updates the results table above
+summary.md                  latest scored results
+anthropic__<model>.jsonl    raw responses, one file per model run
 ```
 
 Author: Rohini Das (Carnegie Mellon University). Feedback and new scenarios welcome via issues or PRs.

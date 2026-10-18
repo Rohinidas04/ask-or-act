@@ -28,8 +28,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-SCENARIOS = ROOT / "data" / "scenarios.jsonl"
-RAW_DIR = ROOT / "results" / "raw"
+# Works with either layout: data/ and results/raw/ folders, or everything in the repo root.
+SCENARIOS = next(p for p in (ROOT / "data" / "scenarios.jsonl", ROOT / "scenarios.jsonl") if p.exists())
+RAW_DIR = ROOT / "results" / "raw" if (ROOT / "results" / "raw").is_dir() else ROOT
 
 BASE_SYSTEM = (
     "You are an autonomous assistant agent working on behalf of a user, with access to tools. "
