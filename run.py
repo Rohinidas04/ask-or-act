@@ -11,6 +11,10 @@ Examples
   export OPENAI_API_KEY=...
   python run.py --provider openai --model <model-id> --base-url https://api.openai.com/v1
 
+  # Cohere API (native v2 chat endpoint). Trial keys allow 20 requests/minute, so throttle.
+  export COHERE_API_KEY=...
+  python run.py --provider cohere --model <model-id> --samples 3 --rpm 18 --workers 2 --resume
+
   # Check the pipeline without spending anything
   python run.py --provider mock --model keyword-baseline
 """
@@ -21,6 +25,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -136,6 +141,41 @@ def call_openai(model, system, user, args):
     return out["choices"][0]["message"]["content"] or ""
 
 
+def call_cohere(model, system, user, args):
+    """Cohere's native v2 chat endpoint."""
+    key = os.environ.get("COHERE_API_KEY")
+    if not key:
+        sys.exit("Set COHERE_API_KEY")
+    base = args.base_url or "https://api.cohere.com"
+    out = _post(
+        f"{base.rstrip('/')}/v2/chat",
+        {"Authorization": f"Bearer {key}", "content-type": "application/json"},
+        _with_temp({
+            "model": model,
+            "max_tokens": 4000,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }, args),
+    )
+    parts = (out.get("message") or {}).get("content") or []
+    return "".join(b.get("text", "") for b in parts if b.get("type", "text") == "text")
+
+
+class RateLimiter:
+    """Spaces calls evenly so a run stays under a requests-per-minute limit, across threads."""
+
+    def __init__(self, rpm):
+        self.interval = 60.0 / rpm
+        self.lock = threading.Lock()
+        self.next_slot = time.monotonic()
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            slot = max(now, self.next_slot)
+            self.next_slot = slot + self.interval
+        time.sleep(max(0.0, slot - now))
+
+
 RISK_WORDS = re.compile(
     r"rm -rf|delete|drop|force|terminate|grant|admin|password|0\.0\.0\.0|production|\$\d{3,}|public link|external",
     re.I,
@@ -149,7 +189,7 @@ def call_mock(model, system, user, args):
     return json.dumps({"decision": "ESCALATE" if risky else "ACT", "reason": "keyword baseline"})
 
 
-PROVIDERS = {"anthropic": call_anthropic, "openai": call_openai, "mock": call_mock}
+PROVIDERS = {"anthropic": call_anthropic, "openai": call_openai, "cohere": call_cohere, "mock": call_mock}
 
 
 def parse_decision(text):
@@ -176,6 +216,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=None, help="omit to use the provider default")
     ap.add_argument("--samples", type=int, default=1, help="samples per scenario per condition")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--rpm", type=float, default=None, help="cap requests per minute (for rate-limited keys)")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep finished rows from an earlier run of this model and only redo missing or failed calls")
     ap.add_argument("--dry-run", action="store_true", help="print one prompt and exit")
     args = ap.parse_args()
 
@@ -188,9 +231,30 @@ def main():
     call = PROVIDERS[args.provider]
     jobs = [(s, p, pr, k) for s in scenarios for p, pr in CONDITIONS for k in range(args.samples)]
 
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{args.provider}__{args.model}")
+    out = RAW_DIR / f"{safe}.jsonl"
+
+    # --resume: reuse calls that already succeeded, so a rate limit or a dropped connection
+    # partway through does not cost the whole run again.
+    done = {}
+    if args.resume and out.exists():
+        for line in out.read_text().splitlines():
+            if line.strip():
+                r = json.loads(line)
+                if r.get("error") is None:
+                    done[(r["id"], r["condition"], r["sample"])] = r
+    todo = [j for j in jobs if (j[0]["id"], condition_name(j[1], j[2]), j[3]) not in done]
+    if done:
+        print(f"Resuming: {len(done)} calls already done, {len(todo)} to go")
+
+    limiter = RateLimiter(args.rpm) if args.rpm else None
+
     def run(job):
         s, p, pr, k = job
         system, user = build_messages(s, p, pr)
+        if limiter:
+            limiter.wait()
         try:
             text = call(args.model, system, user, args)
             err = None
@@ -203,12 +267,20 @@ def main():
         }
 
     t0 = time.time()
+    # Make one call first. If the key or model id is wrong, stop here instead of
+    # failing hundreds of rate-limited calls.
+    first = [run(todo[0])] if todo else []
+    if first and first[0]["error"]:
+        sys.exit(f"First call failed, nothing was written. Fix this and rerun:\n{first[0]['error']}")
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        rows = list(ex.map(run, jobs))
+        results = first + list(ex.map(run, todo[1:]))
+    new = {(r["id"], r["condition"], r["sample"]): r for r in results}
 
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{args.provider}__{args.model}")
-    out = RAW_DIR / f"{safe}.jsonl"
+    # Write rows in the same order every time, whether they are new or resumed.
+    rows = []
+    for s, p, pr, k in jobs:
+        key = (s["id"], condition_name(p, pr), k)
+        rows.append(new.get(key) or done[key])
     out.write_text("".join(json.dumps(r) + "\n" for r in rows))
     errs = sum(r["error"] is not None for r in rows)
     unparsed = sum(r["decision"] is None for r in rows)
